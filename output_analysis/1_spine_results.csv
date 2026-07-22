@@ -1,0 +1,3 @@
+Target_ID,Z_Slice,Y,X,Vol_voxels,Vol_um3,Max_Intensity,Sum_Intensity,Integrated_Density,Z_Slices_Count,Dendrite_Length_um
+1,30,210,149,1544,5.402764799999999,807,693623.0,693623.0,14,59.71843014836384
+3,28,142,135,894,3.1282848,512,257802.0,257802.0,15,59.71843014836384
