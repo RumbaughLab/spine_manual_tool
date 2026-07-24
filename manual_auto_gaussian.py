@@ -7,7 +7,7 @@ from matplotlib.colors import ListedColormap
 from tifffile import imread, imwrite
 from skimage.filters import gaussian
 from skimage.draw import disk
-from scipy.ndimage import distance_transform_edt, label, binary_fill_holes, uniform_filter, maximum_position, binary_erosion
+from scipy.ndimage import distance_transform_edt, label, binary_fill_holes, uniform_filter, maximum_position, gaussian_filter
 import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML
 
@@ -36,6 +36,7 @@ state = {
     'mask': None,
     'shaft_barrier': None,
     
+    # Extra Paint / Erase State
     'painted_barrier_2d': None,
     'erased_barrier_2d': None,
     'is_drawing': False,
@@ -119,27 +120,28 @@ save_barrier_btn = widgets.Button(description='Save Barrier', button_style='info
 
 z_slider = widgets.IntSlider(value=0, min=0, max=1, description='Z-Slice:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
 wl_slider = widgets.IntRangeSlider(value=[0, 1], min=0, max=1, description='Win/Lvl:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
-barrier_slider = widgets.FloatSlider(value=1.2, min=0.5, max=4.0, step=0.1, description='Barrier µm:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
-tol_slider = widgets.FloatSlider(value=0.45, min=0.05, max=0.90, step=0.05, description='Tolerance:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
-z_search_slider = widgets.IntSlider(value=10, min=0, max=20, step=1, description='Z-Search:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
 
+barrier_slider = widgets.FloatSlider(value=1.2, min=0.5, max=4.0, step=0.1, description='Barrier µm:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
+tol_slider = widgets.FloatSlider(value=0.25, min=0.05, max=0.90, step=0.05, description='Tolerance:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
+z_search_slider = widgets.IntSlider(value=3, min=0, max=10, step=1, description='Z-Search:', style={'description_width': '90px'}, layout=widgets.Layout(width='360px'))
 max_geodesic_slider = widgets.FloatSlider(value=5.0, min=1.0, max=15.0, step=0.5, description='Max Geodesic µm:', style={'description_width': '105px'}, layout=widgets.Layout(width='360px'))
 
-show_targets_cb = widgets.Checkbox(value=True, description='Show Markers', indent=False, layout=widgets.Layout(width='140px'))
-show_mask_cb = widgets.Checkbox(value=True, description='Show Segment', indent=False, layout=widgets.Layout(width='140px'))
+# NEW HESSIAN WIDGETS
+use_hessian_cb = widgets.Checkbox(value=True, description='Use Hessian Curvature Isolation', indent=False, layout=widgets.Layout(width='230px'))
+strictness_slider = widgets.FloatSlider(value=0.01, min=-0.05, max=0.05, step=0.005, description='Blob Strictness:', style={'description_width': '100px'}, layout=widgets.Layout(width='360px'))
+
+show_targets_cb = widgets.Checkbox(value=True, description='Show Markers', indent=False, layout=widgets.Layout(width='120px'))
+show_mask_cb = widgets.Checkbox(value=True, description='Show Segment', indent=False, layout=widgets.Layout(width='120px'))
 
 target_list_ui = widgets.Select(options=[], description='Target List:', style={'description_width': 'initial'}, layout={'width': '365px', 'height': '150px'})
 delete_target_btn = widgets.Button(description='Delete Selected Target', button_style='danger', icon='trash', layout=widgets.Layout(width='365px'))
 
-# Rename UI
 rename_id_input = widgets.Text(placeholder='New ID', layout=widgets.Layout(width='180px'))
 rename_id_btn = widgets.Button(description='Update Target ID', button_style='warning', icon='edit', layout=widgets.Layout(width='180px'))
 
-# Control Buttons
-auto_seed_btn = widgets.Button(description='Auto-Seed', button_style='warning', icon='magic', layout=widgets.Layout(width='365px'))
-save_target_btn = widgets.Button(description='Spine (z)', button_style='info', icon='bookmark', layout=widgets.Layout(width='115px'))
-suboptimal_btn = widgets.Button(description='Sub (c)', button_style='danger', icon='exclamation-triangle', layout=widgets.Layout(width='115px'))
-filopodia_btn = widgets.Button(description='Filo (x)', button_style='warning', icon='tag', layout=widgets.Layout(width='115px'))
+auto_seed_btn = widgets.Button(description='Auto-Seed (Fiji-Style)', button_style='warning', icon='magic', layout=widgets.Layout(width='365px'))
+save_target_btn = widgets.Button(description='Save Spine (z)', button_style='info', icon='bookmark', layout=widgets.Layout(width='180px'))
+filopodia_btn = widgets.Button(description='Save Filo (x)', button_style='warning', icon='tag', layout=widgets.Layout(width='180px'))
 undo_target_btn = widgets.Button(description='Undo Last', button_style='danger', icon='undo', layout=widgets.Layout(width='180px'))
 
 reset_view_btn = widgets.Button(description='Reset View (a)', button_style='', icon='home', layout=widgets.Layout(width='180px'))
@@ -148,7 +150,6 @@ pan_btn = widgets.Button(description='Pan Image (d)', button_style='', icon='arr
 
 analyze_all_btn = widgets.Button(description='Analyze All Targets', button_style='success', icon='cogs', layout=widgets.Layout(width='365px'))
 next_image_btn = widgets.Button(description='Next Image >', button_style='primary', icon='arrow-right', layout=widgets.Layout(width='365px'))
-
 custom_id_input = widgets.Text(placeholder='Override Start ID...', description='Custom ID:', layout=widgets.Layout(width='365px'))
 
 log_output = widgets.Output()
@@ -163,6 +164,40 @@ def get_effective_barrier():
     
     effective = (base | painted_3d) & (~erased_3d)
     return effective
+
+def get_hessian_blob_mask(V_sub, strictness, sig=1.0):
+    """Computes the 3D Hessian locally and uses the largest eigenvalue to sever shafts."""
+    if V_sub.shape[0] >= 3:
+        Dzz = gaussian_filter(V_sub, sigma=sig, order=[2, 0, 0])
+        Dyy = gaussian_filter(V_sub, sigma=sig, order=[0, 2, 0])
+        Dxx = gaussian_filter(V_sub, sigma=sig, order=[0, 0, 2])
+        Dzy = gaussian_filter(V_sub, sigma=sig, order=[1, 1, 0])
+        Dzx = gaussian_filter(V_sub, sigma=sig, order=[1, 0, 1])
+        Dyx = gaussian_filter(V_sub, sigma=sig, order=[0, 1, 1])
+
+        # Construct 3x3 array for every voxel to find Eigenvalues
+        H = np.zeros((3, 3) + V_sub.shape)
+        H[0, 0] = Dzz; H[0, 1] = Dzy; H[0, 2] = Dzx
+        H[1, 0] = Dzy; H[1, 1] = Dyy; H[1, 2] = Dyx
+        H[2, 0] = Dzx; H[2, 1] = Dyx; H[2, 2] = Dxx
+        H = np.moveaxis(H, [0, 1], [-2, -1])
+
+        # Largest eigenvalue (l1): if <= strictness, it's a blob. If positive, it's a tube/flat
+        l1 = np.linalg.eigvalsh(H)[..., 2] 
+    else:
+        # Fallback to 2D slice-by-slice Hessian if the Z-stack is extremely thin
+        l1 = np.zeros_like(V_sub)
+        for zi in range(V_sub.shape[0]):
+            slice_v = V_sub[zi]
+            Dyy = gaussian_filter(slice_v, sigma=sig, order=[2, 0])
+            Dxx = gaussian_filter(slice_v, sigma=sig, order=[0, 2])
+            Dxy = gaussian_filter(slice_v, sigma=sig, order=[1, 1])
+            H2 = np.zeros((2, 2) + slice_v.shape)
+            H2[0,0]=Dyy; H2[0,1]=Dxy; H2[1,0]=Dxy; H2[1,1]=Dxx
+            H2 = np.moveaxis(H2, [0,1], [-2,-1])
+            l1[zi] = np.linalg.eigvalsh(H2)[..., 1]
+            
+    return l1 <= strictness
 
 def find_optimal_xyz(x, y, search_radius=5):
     """Unified shared function to precisely scan a 3D local bounding box to find the optimal XYZ peak using voxel averaging."""
@@ -190,18 +225,14 @@ def find_optimal_xyz(x, y, search_radius=5):
     max_idx = np.argmax(sub_volume)
     z_loc, dy_loc, dx_loc = np.unravel_index(max_idx, sub_volume.shape)
     
-    opt_z = int(z_loc)
-    opt_y = int(y_min + dy_loc)
-    opt_x = int(x_min + dx_loc)
-    
-    return opt_z, opt_y, opt_x
+    return int(z_loc), int(y_min + dy_loc), int(x_min + dx_loc)
 
 def auto_generate_seeds(b=None):
     if state['raw_stack'] is None: return
     
     with log_output:
         clear_output()
-        print("🔍 Running background subtraction & geodesic filtering for auto-seeding...")
+        print("🔍 Running Fiji-style background subtraction & geodesic filtering for auto-seeding...")
         
     state['saved_targets'] = []
     
@@ -256,7 +287,7 @@ def auto_generate_seeds(b=None):
                 'idx': idx, 'label': label_text, 
                 'z': opt_z, 'y': opt_y, 'x': opt_x,
                 'click_x': x_loc, 'click_y': y_loc,
-                'target_type': 'spine'
+                'is_filopodia': False
             })
             state['target_counter'] += 1
             
@@ -399,13 +430,7 @@ def refresh_display():
             
         if state['saved_targets']:
             for t in state['saved_targets']:
-                t_type = t.get('target_type', 'spine')
-                if t_type == 'filopodia':
-                    color = 'blue'
-                elif t_type == 'suboptimal':
-                    color = 'orange'
-                else:
-                    color = 'red'
+                color = 'blue' if t.get('is_filopodia', False) else 'red'
                 
                 cx, cy = t.get('click_x', t['x']), t.get('click_y', t['y'])
                 d1_c, = ax1.plot(cx, cy, marker='o', color='red', markersize=3, linestyle='None')
@@ -576,7 +601,7 @@ def on_scroll(event):
         state['z'] = max(state['z'] - 1, 0)
     refresh_display()
 
-def on_save_target(target_type='spine'):
+def on_save_target(is_filopodia=False):
     if state['click_x'] is not None and mode_radio.value == 'Target Spines':
         opt_z, opt_y, opt_x = state['target_z'], state['target_y'], state['target_x']
         click_x, click_y = state['click_x'], state['click_y']
@@ -587,31 +612,22 @@ def on_save_target(target_type='spine'):
             custom_id_input.value = ''
             
         idx = state['target_counter']
-        
-        if target_type == 'filopodia':
-            label_prefix = "[Filo]"
-        elif target_type == 'suboptimal':
-            label_prefix = "[Sub]"
-        else:
-            label_prefix = ""
-            
-        label_text = f"{label_prefix} [{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x}".strip()
+        label_prefix = "[Filo]" if is_filopodia else ""
+        label_text = f"{label_prefix} [{idx}] Z:{opt_z+1} Y:{opt_y} X:{opt_x}"
         
         if not any(t['z'] == opt_z and t['y'] == opt_y and t['x'] == opt_x for t in state['saved_targets']):
             state['saved_targets'].append({
                 'idx': idx, 'label': label_text, 
                 'z': opt_z, 'y': opt_y, 'x': opt_x,
                 'click_x': click_x, 'click_y': click_y,
-                'target_type': target_type
+                'is_filopodia': is_filopodia
             })
             state['target_counter'] += 1
             target_list_ui.options = [t['label'] for t in state['saved_targets']]
             
             with log_output:
                 clear_output()
-                if target_type == 'filopodia': tag = "Filopodia"
-                elif target_type == 'suboptimal': tag = "Suboptimal Spine"
-                else: tag = "Target Spine"
+                tag = "Filopodia" if is_filopodia else "Target Spine"
                 print(f"💾 Saved {tag} {idx} at Z:{opt_z+1}, Y:{opt_y}, X:{opt_x}")
             
             refresh_display()
@@ -650,12 +666,8 @@ def on_rename_target(b=None):
     if target_data:
         target_data['idx'] = new_id
         
-        t_type = target_data.get('target_type', 'spine')
-        label_prefix = ""
-        if t_type == 'filopodia': label_prefix = "[Filo]"
-        elif t_type == 'suboptimal': label_prefix = "[Sub]"
-            
-        new_label = f"{label_prefix} [{new_id}] Z:{target_data['z']+1} Y:{target_data['y']} X:{target_data['x']}".strip()
+        label_prefix = "[Filo]" if target_data.get('is_filopodia', False) else ""
+        new_label = f"{label_prefix} [{new_id}] Z:{target_data['z']+1} Y:{target_data['y']} X:{target_data['x']}"
         
         target_data['label'] = new_label
         target_list_ui.options = [t['label'] for t in state['saved_targets']]
@@ -682,11 +694,9 @@ def on_undo_target(b=None):
 
 def on_key_press(event):
     if event.key == 'z':
-        on_save_target(target_type='spine')
+        on_save_target(is_filopodia=False)
     elif event.key == 'x':
-        on_save_target(target_type='filopodia')
-    elif event.key == 'c':
-        on_save_target(target_type='suboptimal')
+        on_save_target(is_filopodia=True)
     elif event.key == 'u':
         on_undo_target()
     elif event.key in ['delete', 'backspace']:
@@ -736,15 +746,12 @@ def on_analyze_all(b):
         for target in state['saved_targets']:
             z, y, x, idx = target['z'], target['y'], target['x'], target['idx']
             orig_x, orig_y = target['click_x'], target['click_y']
-            
-            t_type = target.get('target_type', 'spine')
-            # Fallback for old filopodia boolean if queue somehow persisted
-            if target.get('is_filopodia', False): t_type = 'filopodia'
+            is_filo = target.get('is_filopodia', False)
             
             geo_dist_um = float(state['dist_field_3d'][z, y, x]) if state['dist_field_3d'] is not None else 0.0
             if np.isinf(geo_dist_um): geo_dist_um = 0.0
             
-            if t_type == 'filopodia':
+            if is_filo:
                 results_list.append({
                     'Target_ID': idx, 
                     'Classification': 'Filopodia',
@@ -753,9 +760,6 @@ def on_analyze_all(b):
                     'Original_X': orig_x,
                     'Corrected_Y': y, 
                     'Corrected_X': x, 
-                    'Local_Dendrite_Surface_Max': 0,
-                    'Local_Dendrite_Surface_IntDen': 0.0,
-                    'Area_Opt_Z_um2': 0.0,
                     'Geodesic_Distance_um': geo_dist_um,
                     'Vol_voxels': 0, 
                     'Vol_um3': 0.0,
@@ -770,89 +774,81 @@ def on_analyze_all(b):
                     'Dendrite_Length_um': state['dendrite_length_um']
                 })
                 continue
+            
+            # Use Local Sub-Volume for Lightning Fast Hessian & Thresholding
+            pad_xy = 25
+            pad_z = current_zsearch_val
+            
+            z_min = max(0, z - pad_z)
+            z_max = min(current_smoothed_stack.shape[0], z + pad_z + 1)
+            y_min = max(0, y - pad_xy)
+            y_max = min(current_smoothed_stack.shape[1], y + pad_xy + 1)
+            x_min = max(0, x - pad_xy)
+            x_max = min(current_smoothed_stack.shape[2], x + pad_xy + 1)
+            
+            sub_stack = current_smoothed_stack[z_min:z_max, y_min:y_max, x_min:x_max]
+            lz, ly, lx = z - z_min, y - y_min, x - x_min
                 
             if state['erased_barrier_2d'] is not None and state['erased_barrier_2d'][y, x]:
                 seed_val = state['base_smoothed_stack'][z, y, x]
             else:
-                seed_val = current_smoothed_stack[z, y, x]
+                seed_val = sub_stack[lz, ly, lx]
 
             if seed_val == 0:
                 print(f"❌ Target [{idx}] skipped: Seed is inside the pink dendritic barrier.")
                 continue
                 
             lower_bound = max(seed_val * (1.0 - current_tolerance_val), 1e-6)
-            binary_thresh = current_smoothed_stack >= lower_bound
+            local_binary = sub_stack >= lower_bound
             
-            # --- Z-SEARCH RANGE BOUNDARY ---
-            z_min = max(0, z - current_zsearch_val)
-            z_max = min(current_smoothed_stack.shape[0], z + current_zsearch_val + 1)
-            binary_thresh[:z_min, :, :] = False
-            binary_thresh[z_max:, :, :] = False
+            # --- HESSIAN SHAPE ISOLATION (OVER-SEGMENTATION PREVENTION) ---
+            if use_hessian_cb.value:
+                V = sub_stack.astype(float)
+                v_max = V.max()
+                if v_max > 0: V = V / v_max
+                
+                # Retrieve mask where largest eigenvalue (l1) drops below strictness threshold
+                blob_mask = get_hessian_blob_mask(V, strictness_slider.value, sig=1.0)
+                
+                # Protect the absolute seed voxel to guarantee Region-Growing has a starting point
+                blob_mask[lz, ly, lx] = True 
+                local_binary = local_binary & blob_mask
             
-            labeled_mask, _ = label(binary_thresh)
-            seed_label = labeled_mask[z, y, x]
+            labeled_local, _ = label(local_binary)
+            seed_label = labeled_local[lz, ly, lx]
             
             if seed_label == 0:
-                print(f"❌ Target [{idx}] skipped: Threshold too strict or point invalid.")
+                print(f"❌ Target [{idx}] skipped: Curvature isolation or threshold eliminated the point.")
                 continue
                 
-            spine_mask = (labeled_mask == seed_label)
-            spine_mask = binary_fill_holes(spine_mask)
+            local_spine_mask = (labeled_local == seed_label)
+            local_spine_mask = binary_fill_holes(local_spine_mask)
             
-            classification_label = 'Spine'
+            # Push the optimized sub-volume mask back into the global spatial layout
+            global_spine_mask = np.zeros_like(combined_mask)
+            global_spine_mask[z_min:z_max, y_min:y_max, x_min:x_max] = local_spine_mask
+            combined_mask = np.logical_or(combined_mask, global_spine_mask)
             
-            if t_type == 'spine':
-                # Normal Spine: Append its volume into the combined total visual mask
-                combined_mask = np.logical_or(combined_mask, spine_mask)
-            elif t_type == 'suboptimal':
-                # Suboptimal Spine: Extract measurements, but explicitly DO NOT add to visual combined mask
-                classification_label = 'Suboptimal Measures'
-            
-            voxels = np.sum(spine_mask)
+            # Metrics
+            voxels = np.sum(local_spine_mask)
             vol = voxels * voxel_volume
-            max_intensity = int(state['raw_stack'][spine_mask].max())
-            sum_intensity = np.sum(state['raw_stack'][spine_mask], dtype=np.float64)
+            
+            # Calculate Intensity Metrics precisely from Raw Stack utilizing the global mask layout
+            global_target_mask = global_spine_mask
+            max_intensity = int(state['raw_stack'][global_target_mask].max())
+            sum_intensity = np.sum(state['raw_stack'][global_target_mask], dtype=np.float64)
             int_density = sum_intensity
-            z_slices_count = int(np.sum(np.any(spine_mask, axis=(1, 2))))
-            
-            # Area at Optimal Z
-            area_opt_z_voxels = np.sum(spine_mask[z, :, :])
-            area_opt_z_um2 = area_opt_z_voxels * (dx * dy)
-            
-            # Local Dendrite Surface Metrics using Geodesic Barrier
-            pad_xy = 25
-            pad_z = current_zsearch_val
-            z_min_loc = max(0, z - pad_z)
-            z_max_loc = min(state['raw_stack'].shape[0], z + pad_z + 1)
-            y_min_loc = max(0, y - pad_xy)
-            y_max_loc = min(state['raw_stack'].shape[1], y + pad_xy + 1)
-            x_min_loc = max(0, x - pad_xy)
-            x_max_loc = min(state['raw_stack'].shape[2], x + pad_xy + 1)
-
-            local_barrier = total_barrier[z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
-            local_raw = state['raw_stack'][z_min_loc:z_max_loc, y_min_loc:y_max_loc, x_min_loc:x_max_loc]
-            
-            local_barrier_surface = local_barrier & ~binary_erosion(local_barrier)
-            
-            if np.any(local_barrier_surface):
-                local_dend_surf_max = int(local_raw[local_barrier_surface].max())
-                local_dend_surf_sum = float(np.sum(local_raw[local_barrier_surface]))
-            else:
-                local_dend_surf_max = 0
-                local_dend_surf_sum = 0.0
+            z_slices_count = int(np.sum(np.any(global_target_mask, axis=(1, 2))))
             
             results_list.append({
                 'Target_ID': idx, 
-                'Classification': classification_label,
+                'Classification': 'Spine',
                 'Z_Slice': z + 1, 
                 'Original_Y': orig_y,
                 'Original_X': orig_x,
                 'Corrected_Y': y, 
                 'Corrected_X': x, 
-                'Local_Dendrite_Surface_Max': local_dend_surf_max,
-                'Local_Dendrite_Surface_IntDen': local_dend_surf_sum,
-                'Area_Opt_Z_um2': area_opt_z_um2,
-                'Geodesic_Distance_um': geo_dist_um, 
+                'Geodesic_Distance_um': geo_dist_um,
                 'Vol_voxels': voxels, 
                 'Vol_um3': vol,
                 'Max_Intensity': max_intensity,
@@ -914,14 +910,7 @@ def on_analyze_all(b):
     for _, row in final_results_df.iterrows():
         rx, ry = int(row['Corrected_X']), int(row['Corrected_Y'])
         tid = int(row['Target_ID'])
-        
-        c_class = row['Classification']
-        if c_class == 'Filopodia':
-            color = 'cyan'
-        elif c_class == 'Suboptimal Measures':
-            color = 'orange'
-        else:
-            color = 'yellow'
+        color = 'cyan' if row['Classification'] == 'Filopodia' else 'yellow'
         
         ax_mip.plot(rx, ry, '.', color=color, label=str(tid))
         ax_mip.text(rx + 3, ry, str(tid), color=color, fontsize=9, fontweight='bold',
@@ -1001,11 +990,8 @@ save_barrier_btn.on_click(on_save_barrier)
 auto_seed_btn.on_click(auto_generate_seeds)
 delete_target_btn.on_click(on_delete_selected_target)
 rename_id_btn.on_click(on_rename_target)
-
-save_target_btn.on_click(lambda b: on_save_target('spine'))
-suboptimal_btn.on_click(lambda b: on_save_target('suboptimal'))
-filopodia_btn.on_click(lambda b: on_save_target('filopodia'))
-
+save_target_btn.on_click(lambda b: on_save_target(is_filopodia=False))
+filopodia_btn.on_click(lambda b: on_save_target(is_filopodia=True))
 undo_target_btn.on_click(on_undo_target)
 reset_view_btn.on_click(on_reset_view)
 zoom_rect_btn.on_click(on_zoom_rect)
@@ -1023,7 +1009,7 @@ col1 = widgets.VBox([
     delete_target_btn,
     widgets.HBox([rename_id_input, rename_id_btn]),
     auto_seed_btn,
-    widgets.HBox([save_target_btn, suboptimal_btn, filopodia_btn]),
+    widgets.HBox([save_target_btn, filopodia_btn]),
     widgets.HBox([undo_target_btn, reset_view_btn]),
     widgets.HBox([zoom_rect_btn, pan_btn]),
     analyze_all_btn, next_image_btn,
@@ -1037,6 +1023,7 @@ col2 = widgets.VBox([
 col3 = widgets.VBox([
     widgets.HBox([mode_radio, widgets.VBox([brush_size_slider, widgets.HBox([clear_paint_btn, save_barrier_btn])])]),
     z_slider, wl_slider, barrier_slider, tol_slider, z_search_slider, max_geodesic_slider,
+    use_hessian_cb, strictness_slider,
     widgets.HBox([show_targets_cb, show_mask_cb])
 ], layout=widgets.Layout(width='390px', padding='0px 0px 0px 10px'))
 
